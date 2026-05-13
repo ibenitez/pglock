@@ -16,7 +16,27 @@ limitations under the License.
 
 package pglock
 
+import "fmt"
+
 // Logger is used for internal inspection of the lock client.
 type Logger interface {
-	Println(v ...interface{})
+	Println(v ...any)
+}
+
+// LevelLogger is used for internal inspection of the lock client.
+type LevelLogger interface {
+	Debug(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
+type flatLogger struct {
+	l Logger
+}
+
+func (fl *flatLogger) Debug(msg string, args ...any) {
+	fl.l.Println(fmt.Sprintf(msg, args...))
+}
+
+func (fl *flatLogger) Error(msg string, args ...any) {
+	fl.l.Println(fmt.Sprintf(msg, args...))
 }

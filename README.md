@@ -1,10 +1,8 @@
 # PostgreSQL Lock Client for Go
 
 [![GoDoc](https://godoc.org/cirello.io/pglock?status.svg)](https://godoc.org/cirello.io/pglock)
-[![Coverage Status](https://coveralls.io/repos/github/cirello-io/pglock/badge.svg?branch=master)](https://coveralls.io/github/cirello-io/pglock?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cirello-io/pglock)](https://goreportcard.com/report/github.com/cirello-io/pglock)
+[![Build status](https://github.com/cirello-io/pglock/actions/workflows/go.yml/badge.svg)](https://github.com/cirello-io/pglock/actions/workflows/go.yml)
 [![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go)
-[![SLA](https://img.shields.io/badge/SLA-95%25-brightgreen.svg)](https://github.com/cirello-io/public/blob/master/SLA.md)
 
 The PostgreSQL Lock Client for Go is a general purpose distributed locking
 library built for PostgreSQL. The PostgreSQL Lock Client for Go supports both
@@ -12,7 +10,7 @@ fine-grained and coarse-grained locking as the lock keys can be any arbitrary
 string, up to a certain length. Please create issues in the GitHub repository
 with questions, pull request are very much welcome.
 
-_Recommended PostgreSQL version: 11 or newer_
+_Recommended PostgreSQL version: 13 or newer_
 
 ## Use cases
 A common use case for this lock client is:
@@ -100,3 +98,9 @@ the lock is stale and expire it.
 
 What this means is that, even if two different machines disagree about what time
 it is, they will still avoid clobbering each other's locks.
+
+## Go Version Compatibility Promise
+
+This package follows the same guidance as the Go's:
+
+> Each major Go release is supported until there are two newer major releases. For example, Go 1.5 was supported until the Go 1.7 release, and Go 1.6 was supported until the Go 1.8 release. We fix critical problems, including critical security problems, in supported releases as needed by issuing minor revisions (for example, Go 1.6.1, Go 1.6.2, and so on).

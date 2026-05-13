@@ -2,17 +2,15 @@ name: Go
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
-  schedule:
-    - cron: '0 0 * * *'
+  merge_group:
 
 jobs:
   build:
     strategy:
       matrix:
-        postgres-version: [15, 14, 13, 12, 11]
+        postgres-version: ['latest', 16, 15, 14, 13]
     runs-on: ubuntu-latest
 
     services:
@@ -27,25 +25,25 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
 
     - name: Setup Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v6
       with:
-        go-version: 'stable'
+        go-version-file: "go.mod"
 
-    - name: Setup golangci-lint
-      uses: golangci/golangci-lint-action@v3
+    - name: golangci-lint cache
+      uses: actions/cache@v5
       with:
-        skip-cache: true
+        path: ~/go/bin/golangci-lint
+        key: ${{ runner.os }}-golangci-lint-v2.4.0
 
     - name: Test
       run: |
-        go test -coverprofile=coverage.out -shuffle on -short -v -dsn="postgres://postgres:everyone@localhost:5432/postgres?sslmode=disable" || (sleep 5; go test -coverprofile=coverage.out -shuffle on -short -v -dsn="postgres://postgres:everyone@localhost:5432/postgres?sslmode=disable")
-        go tool cover -html=coverage.out -o coverage.html
+        make linters test
 
     - name: Upload coverage
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: coverage
+        name: coverage_${{ matrix.postgres-version }}
         path: coverage.html

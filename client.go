@@ -21,7 +21,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -55,13 +55,13 @@ type Client struct {
 	tableName          string
 	leaseDuration      time.Duration
 	heartbeatFrequency time.Duration
-	log                Logger
+	log                LevelLogger
 	owner              string
 }
 
 // New returns a locker client from the given database connection. This function
 // validates that *sql.DB holds a ratified postgreSQL driver (lib/pq).
-func New(db *sql.DB, opts ...ClientOption) (_ *Client, err error) {
+func New(db *sql.DB, opts ...ClientOption) (*Client, error) {
 	if db == nil {
 		return nil, ErrNotPostgreSQLDriver
 	} else if _, ok := db.Driver().(*pq.Driver); !ok {
@@ -72,20 +72,20 @@ func New(db *sql.DB, opts ...ClientOption) (_ *Client, err error) {
 
 // UnsafeNew returns a locker client from the given database connection. This
 // function does not check if *sql.DB holds a ratified postgreSQL driver.
-func UnsafeNew(db *sql.DB, opts ...ClientOption) (_ *Client, err error) {
+func UnsafeNew(db *sql.DB, opts ...ClientOption) (*Client, error) {
 	if db == nil {
 		return nil, ErrNotPostgreSQLDriver
 	}
 	return newClient(db, opts...)
 }
 
-func newClient(db *sql.DB, opts ...ClientOption) (_ *Client, err error) {
+func newClient(db *sql.DB, opts ...ClientOption) (*Client, error) {
 	c := &Client{
 		db:                 db,
 		tableName:          DefaultTableName,
 		leaseDuration:      DefaultLeaseDuration,
 		heartbeatFrequency: DefaultHeartbeatFrequency,
-		log:                log.New(ioutil.Discard, "", 0),
+		log:                &flatLogger{log.New(io.Discard, "", 0)},
 		owner:              fmt.Sprintf("pglock-%v", rand.Int()),
 	}
 	for _, opt := range opts {
@@ -179,28 +179,23 @@ func (c *Client) Acquire(name string, opts ...LockOption) (*Lock, error) {
 func (c *Client) AcquireContext(ctx context.Context, name string, opts ...LockOption) (*Lock, error) {
 	l := c.newLock(ctx, name, opts)
 	for {
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			return nil, ErrNotAcquired
-		default:
-			err := c.retry(ctx, func() error { return c.tryAcquire(ctx, l) })
-			if l.failIfLocked && err == ErrNotAcquired {
-				c.log.Println("not acquired, exit")
-				return l, err
-			} else if err == ErrNotAcquired {
-				c.log.Println("not acquired, wait:", l.leaseDuration)
-				select {
-				case <-time.After(l.leaseDuration):
-				case <-ctx.Done():
-					return l, err
-				}
-				continue
-			} else if err != nil {
-				c.log.Println("error:", err)
-				return nil, err
-			}
-			return l, nil
 		}
+		err := c.retry(func() error { return c.tryAcquire(ctx, l) })
+		switch {
+		case l.failIfLocked && errors.Is(err, ErrNotAcquired):
+			c.log.Debug("not acquired, exit")
+			return l, err
+		case errors.Is(err, ErrNotAcquired):
+			c.log.Debug("not acquired, wait: %v", l.leaseDuration)
+			waitFor(ctx, l.leaseDuration)
+			continue
+		case err != nil:
+			c.log.Error("error: %v", err)
+			return nil, err
+		}
+		return l, nil
 	}
 }
 
@@ -223,44 +218,47 @@ func (c *Client) storeAcquire(ctx context.Context, l *Lock) error {
 	ctx, cancel := context.WithTimeout(ctx, l.leaseDuration)
 	defer cancel()
 
-	rvn, err := c.getNextRVN(ctx, c.db)
+	rvn, err := c.getNextRVN(ctx)
 	if err != nil {
 		return typedError(err, "cannot run query to read record version number")
 	}
 
-	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if err != nil {
-		return typedError(err, "cannot create transaction for lock acquisition")
-	}
-	c.log.Println("storeAcquire in", l.name, rvn, l.data, l.recordVersionNumber)
+	c.log.Debug("storeAcquire in: %v %v %v %v", l.name, rvn, l.data, l.recordVersionNumber)
 	defer func() {
-		c.log.Println("storeAcquire out", l.name, rvn, l.data, l.recordVersionNumber)
+		c.log.Debug("storeAcquire out: %v %v %v %v", l.name, rvn, l.data, l.recordVersionNumber)
 	}()
-	_, err = tx.ExecContext(ctx, `
+	rowLockInfo := c.db.QueryRowContext(ctx, `
 		INSERT INTO `+c.tableName+`
 			("name", "record_version_number", "data", "owner")
 		VALUES
 			($1, $2, $3, $6)
 		ON CONFLICT ("name") DO UPDATE
 		SET
-			"record_version_number" = $2,
+			"record_version_number" = CASE
+				WHEN COALESCE(`+c.tableName+`."record_version_number" = $4, TRUE) THEN $2
+				ELSE `+c.tableName+`."record_version_number"
+			END,
 			"data" = CASE
-				WHEN $5 THEN $3
+				WHEN COALESCE(`+c.tableName+`."record_version_number" = $4, TRUE) THEN
+					CASE
+						WHEN $5 THEN $3
+						ELSE `+c.tableName+`."data"
+					END
 				ELSE `+c.tableName+`."data"
 			END,
-			"owner" = $6
-		WHERE
-			`+c.tableName+`."record_version_number" IS NULL
-			OR `+c.tableName+`."record_version_number" = $4
+			"owner" = CASE
+				WHEN COALESCE(`+c.tableName+`."record_version_number" = $4, TRUE) THEN $6
+				ELSE `+c.tableName+`."owner"
+			END
+		RETURNING
+			"record_version_number", "data", "owner"
 	`, l.name, rvn, l.data, l.recordVersionNumber, l.replaceData, c.owner)
-	if err != nil {
-		return typedError(err, "cannot run query to acquire lock")
-	}
-	rowLockInfo := tx.QueryRowContext(ctx, `SELECT "record_version_number", "data", "owner" FROM `+c.tableName+` WHERE name = $1 FOR UPDATE`, l.name)
-	var actualRVN int64
-	var data []byte
-	var actualOwner string
-	if err := rowLockInfo.Scan(&actualRVN, &data, &actualOwner); err != nil {
+	var (
+		actualRVN   int64
+		actualData  []byte
+		actualOwner string
+	)
+	if err := rowLockInfo.Scan(&actualRVN, &actualData, &actualOwner); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return typedError(err, "cannot load information for lock acquisition")
 	}
 	l.owner = actualOwner
@@ -268,11 +266,8 @@ func (c *Client) storeAcquire(ctx context.Context, l *Lock) error {
 		l.recordVersionNumber = actualRVN
 		return ErrNotAcquired
 	}
-	if err := tx.Commit(); err != nil {
-		return typedError(err, "cannot commit lock acquisition")
-	}
 	l.recordVersionNumber = rvn
-	l.data = data
+	l.data = actualData
 	return nil
 }
 
@@ -308,7 +303,7 @@ func (c *Client) Release(l *Lock) error {
 func (c *Client) ReleaseContext(ctx context.Context, l *Lock) error {
 	l.heartbeatCancel()
 	l.heartbeatWG.Wait()
-	err := c.retry(ctx, func() error { return c.storeRelease(ctx, l) })
+	err := c.retry(func() error { return c.storeRelease(ctx, l) })
 	return err
 }
 
@@ -317,21 +312,34 @@ func (c *Client) storeRelease(ctx context.Context, l *Lock) error {
 	defer l.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, l.leaseDuration)
 	defer cancel()
-	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if err != nil {
-		return typedError(err, "cannot create transaction for lock acquisition")
-	}
-	result, err := tx.ExecContext(ctx, `
-		UPDATE
-			`+c.tableName+`
-		SET
-			"record_version_number" = NULL
-		WHERE
-			"name" = $1
-			AND "record_version_number" = $2
-	`, l.name, l.recordVersionNumber)
-	if err != nil {
-		return typedError(err, "cannot run query to release lock")
+	var result sql.Result
+	switch l.keepOnRelease {
+	case true:
+		res, err := c.db.ExecContext(ctx, `
+			UPDATE
+				`+c.tableName+`
+			SET
+				"record_version_number" = NULL
+			WHERE
+				"name" = $1
+				AND "record_version_number" = $2
+		`, l.name, l.recordVersionNumber)
+		if err != nil {
+			return typedError(err, "cannot run query to release lock (keep)")
+		}
+		result = res
+	case false:
+		res, err := c.db.ExecContext(ctx, `
+			DELETE FROM
+				`+c.tableName+`
+			WHERE
+				"name" = $1
+				AND "record_version_number" = $2
+		`, l.name, l.recordVersionNumber)
+		if err != nil {
+			return typedError(err, "cannot run query to delete lock (delete)")
+		}
+		result = res
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
@@ -340,20 +348,6 @@ func (c *Client) storeRelease(ctx context.Context, l *Lock) error {
 		l.isReleased = true
 		return ErrLockAlreadyReleased
 	}
-	if !l.keepOnRelease {
-		_, err := tx.ExecContext(ctx, `
-		DELETE FROM
-			`+c.tableName+`
-		WHERE
-			"name" = $1
-			AND "record_version_number" IS NULL`, l.name)
-		if err != nil {
-			return typedError(err, "cannot run query to delete lock")
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return typedError(err, "cannot commit lock release")
-	}
 	l.isReleased = true
 	l.heartbeatCancel()
 	return nil
@@ -361,20 +355,16 @@ func (c *Client) storeRelease(ctx context.Context, l *Lock) error {
 
 func (c *Client) heartbeat(ctx context.Context, l *Lock) {
 	defer l.heartbeatWG.Done()
-	c.log.Println("heartbeat started", l.name)
-	defer c.log.Println("heartbeat stopped", l.name)
+	c.log.Debug("heartbeat started: %v", l.name)
+	defer c.log.Debug("heartbeat stopped: %v", l.name)
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := c.SendHeartbeat(ctx, l); err != nil && !isContextError(err) {
+			defer c.log.Error("heartbeat missed: %v", err)
 			return
-		} else if err := c.SendHeartbeat(ctx, l); err != nil {
-			defer c.log.Println("heartbeat missed", err)
-			return
-		}
-		select {
-		case <-time.After(c.heartbeatFrequency):
-		case <-ctx.Done():
+		} else if err := ctx.Err(); err != nil {
 			return
 		}
+		waitFor(ctx, c.heartbeatFrequency)
 	}
 }
 
@@ -386,7 +376,7 @@ func (c *Client) SendHeartbeat(ctx context.Context, l *Lock) error {
 	if l.isReleased {
 		return ErrLockAlreadyReleased
 	}
-	err := c.retry(ctx, func() error { return c.storeHeartbeat(ctx, l) })
+	err := c.retry(func() error { return c.storeHeartbeat(ctx, l) })
 	if err != nil {
 		l.isReleased = true
 		return fmt.Errorf("cannot send heartbeat (%v): %w", l.name, err)
@@ -397,15 +387,11 @@ func (c *Client) SendHeartbeat(ctx context.Context, l *Lock) error {
 func (c *Client) storeHeartbeat(ctx context.Context, l *Lock) error {
 	ctx, cancel := context.WithTimeout(ctx, l.leaseDuration)
 	defer cancel()
-	rvn, err := c.getNextRVN(ctx, c.db)
+	rvn, err := c.getNextRVN(ctx)
 	if err != nil {
 		return typedError(err, "cannot run query to read record version number")
 	}
-	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if err != nil {
-		return typedError(err, "cannot create transaction for lock acquisition")
-	}
-	result, err := tx.ExecContext(ctx, `
+	result, err := c.db.ExecContext(ctx, `
 		UPDATE
 			`+c.tableName+`
 		SET
@@ -422,9 +408,6 @@ func (c *Client) storeHeartbeat(ctx context.Context, l *Lock) error {
 		return typedError(err, "cannot confirm whether the lock has been updated for the heartbeat")
 	} else if affected == 0 {
 		return ErrLockAlreadyReleased
-	}
-	if err := tx.Commit(); err != nil {
-		return typedError(err, "cannot commit lock heartbeat")
 	}
 	l.recordVersionNumber = rvn
 	return nil
@@ -453,13 +436,13 @@ func (c *Client) GetDataContext(ctx context.Context, name string) ([]byte, error
 // holding it first.
 func (c *Client) GetContext(ctx context.Context, name string) (*Lock, error) {
 	var l *Lock
-	err := c.retry(ctx, func() error {
+	err := c.retry(func() error {
 		var err error
 		l, err = c.getLock(ctx, name)
 		return err
 	})
 	if notExist := (&NotExistError{}); err != nil && errors.As(err, &notExist) {
-		c.log.Println("missing lock entry:", err)
+		c.log.Error("missing lock entry: %v", err)
 	}
 	return l, err
 }
@@ -486,8 +469,8 @@ func (c *Client) getLock(ctx context.Context, name string) (*Lock, error) {
 	return l, typedError(err, "cannot load the data of this lock")
 }
 
-func (c *Client) getNextRVN(ctx context.Context, db *sql.DB) (int64, error) {
-	rowRVN := db.QueryRowContext(ctx, `SELECT nextval('`+c.tableName+`_rvn')`)
+func (c *Client) getNextRVN(ctx context.Context) (int64, error) {
+	rowRVN := c.db.QueryRowContext(ctx, `SELECT nextval($1)`, c.tableName+`_rvn`)
 	var rvn int64
 	err := rowRVN.Scan(&rvn)
 	return rvn, err
@@ -495,22 +478,16 @@ func (c *Client) getNextRVN(ctx context.Context, db *sql.DB) (int64, error) {
 
 const maxRetries = 1024
 
-func (c *Client) retry(ctx context.Context, f func() error) error {
-	retryPeriod := c.heartbeatFrequency
-	if retryPeriod == 0 {
-		retryPeriod = c.leaseDuration
-	}
+func (c *Client) retry(f func() error) error {
 	var err error
-	for i := 0; i < maxRetries; i++ {
+	for range maxRetries {
 		err = f()
 		if failedPrecondition := (&FailedPreconditionError{}); err == nil || !errors.As(err, &failedPrecondition) {
 			break
 		}
-		c.log.Println("bad transaction, retrying:", err)
-		select {
-		case <-time.After(retryPeriod):
-		case <-ctx.Done():
-			return err
+		c.log.Debug("bad transaction, retrying: %v", err)
+		if isContextError(err) {
+			break
 		}
 	}
 	return err
@@ -524,7 +501,7 @@ func (c *Client) GetAllLocks() ([]*ReadOnlyLock, error) {
 // GetAllLocksContext returns all known locks in a read-only fashion.
 func (c *Client) GetAllLocksContext(ctx context.Context) ([]*ReadOnlyLock, error) {
 	var locks []*ReadOnlyLock
-	err := c.retry(ctx, func() error {
+	err := c.retry(func() error {
 		var err error
 		locks, err = c.getAllLocks(ctx)
 		return err
@@ -559,7 +536,14 @@ type ClientOption func(*Client)
 
 // WithLogger injects a logger into the client, so its internals can be
 // recorded.
+// Deprecated: Use WithLevelLogger instead.
 func WithLogger(l Logger) ClientOption {
+	return func(c *Client) { c.log = &flatLogger{l} }
+}
+
+// WithLevelLogger injects a logger into the client, so its internals can be
+// recorded.
+func WithLevelLogger(l LevelLogger) ClientOption {
 	return func(c *Client) { c.log = l }
 }
 
@@ -589,11 +573,11 @@ func typedError(err error, msg string) error {
 	const serializationErrorCode = "40001"
 	if err == nil {
 		return nil
-	} else if err == sql.ErrNoRows {
+	} else if errors.Is(err, sql.ErrNoRows) {
 		return &NotExistError{fmt.Errorf(msg+": %w", err)}
-	} else if _, ok := err.(*net.OpError); ok {
+	} else if errNetOp := (&net.OpError{}); errors.As(err, &errNetOp) {
 		return &UnavailableError{fmt.Errorf(msg+": %w", err)}
-	} else if e, ok := err.(*pq.Error); ok && e.Code == serializationErrorCode {
+	} else if errPQ := (&pq.Error{}); errors.As(err, &errPQ) && errPQ.Code == serializationErrorCode {
 		return &FailedPreconditionError{fmt.Errorf(msg+": %w", err)}
 	} else if e, ok := unwrapUntilSQLState(err); ok && e.SQLState() == serializationErrorCode {
 		return &FailedPreconditionError{fmt.Errorf(msg+": %w", err)}
@@ -603,7 +587,7 @@ func typedError(err error, msg string) error {
 
 func unwrapUntilSQLState(err error) (interface{ SQLState() string }, bool) {
 	for {
-		if e, ok := err.(interface{ SQLState() string }); ok {
+		if e, ok := hasSQLState(err); ok {
 			return e, true
 		}
 		err = errors.Unwrap(err)
@@ -611,4 +595,20 @@ func unwrapUntilSQLState(err error) (interface{ SQLState() string }, bool) {
 			return nil, false
 		}
 	}
+}
+
+func hasSQLState(v any) (interface{ SQLState() string }, bool) {
+	sqlState, ok := v.(interface{ SQLState() string })
+	return sqlState, ok
+}
+
+func waitFor(ctx context.Context, d time.Duration) {
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
